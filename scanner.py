@@ -340,7 +340,7 @@ class FTPAnonymousPlugin(VulnerabilityPlugin):
         ]
         
         if any(indicator in banner for indicator in anonymous_indicators):
-            issues.append("Anonymous FTP access可能 habilitado")
+            issues.append("Anonymous FTP access habilitado")
         
         # Versiones específicas vulnerables
         if "vsFTPd 2.3.4" in banner:
@@ -813,6 +813,72 @@ def get_mac_address(ip: str) -> str:
     except Exception:
         return "unknown"
 
+def get_dns_names(ip: str, timeout: float = 2.0) -> str:
+    try:
+        socket.setdefaulttimeout(timeout)
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        return hostname
+    except (socket.herror, socket.gaierror, socket.timeout):
+        return "unknown"
+
+def get_netbios_name(ip: str, timeout: float = 2.0) -> str:
+    """
+    Obtiene el nombre NetBIOS de una IP usando nbtstat (Windows) o nmblookup (Linux)
+    """
+    try:
+        if platform.system().lower() == "windows":
+            cmd = ["nbtstat", "-A", ip]
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+            
+            # Buscar líneas con "<00>" que indican nombre NetBIOS
+            for line in output.split('\n'):
+                if '<00>' in line and 'UNIQUE' in line:
+                    # Extraer el nombre NetBIOS (primer campo antes de espacios)
+                    parts = line.split()
+                    if parts:
+                        netbios_name = parts[0].upper()
+                        # Eliminar espacios y caracteres no deseados
+                        netbios_name = netbios_name.replace('<00>', '').strip()
+                        if netbios_name and netbios_name != "UNIQUE":
+                            return netbios_name
+        else:
+            cmd = ["nmblookup", "-A", ip]
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+            
+            # Buscar nombres NetBIOS en la salida
+            for line in output.split('\n'):
+                if 'Looking up status of' in line:
+                    # Extraer nombre después de "Looking up status of"
+                    name = line.split('Looking up status of')[-1].strip()
+                    if name and name != ip:
+                        return name.upper()
+                elif '<00>' in line and 'UNIQUE' in line:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        return parts[0].upper()
+        
+        return "unknown"
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, Exception):
+        return "unknown"
+
+async def get_host_info(ip: str) -> Dict[str, str]:
+    """
+    Obtiene información completa del host (MAC, DNS, NetBIOS)
+    """
+    # Ejecutar en paralelo las consultas que no requieren subprocess
+    mac = await asyncio.get_event_loop().run_in_executor(None, get_mac_address, ip)
+    
+    # Para DNS y NetBIOS, podemos hacerlas secuencialmente o en paralelo según preferencias
+    dns_name = await asyncio.get_event_loop().run_in_executor(None, get_dns_names, ip)
+    netbios_name = await asyncio.get_event_loop().run_in_executor(None, get_netbios_name, ip)
+    
+    return {
+        "ip": ip,
+        "mac": mac,
+        "dns_name": dns_name,
+        "netbios_name": netbios_name
+    }
+
 # --- Ping funcionality ---
 async def ping_host(host: str, timeout: float =1.0) -> bool:
     try:
@@ -834,7 +900,7 @@ async def ping_host(host: str, timeout: float =1.0) -> bool:
     except (asyncio.TimeoutError, subprocess.SubprocessError, OSError):
         return False
 
-async def ping_hosts_parallel(hosts: List[str], concurrency: int = 100, timeout: float = 1.0) -> Set[tuple]:
+async def ping_hosts_parallel(hosts: List[str], concurrency: int = 100, timeout: float = 1.0, resolve_names: bool = True) -> Set[tuple]:
     active_hosts = set()
     semaphore = asyncio.Semaphore(concurrency)
     
@@ -848,14 +914,28 @@ async def ping_hosts_parallel(hosts: List[str], concurrency: int = 100, timeout:
 
     tasks = [ping_with_semaphore(host) for host in hosts]
 
+    host_info_tasks = []
+
     for completed in asyncio.as_completed(tasks):
         result = await completed
         if result:
-            mac = get_mac_address(result)
-            active_hosts.add((result, mac))
-            print(f"\r[+] Active host: {result} - MAC: {mac}", end = "", flush = True)
+            if resolve_names:
+                host_info_tasks.append(get_host_info(result))
+            else:
+                mac = get_mac_address(result)
+                active_hosts.add((result, mac))
+                print(f"\r[+] Active host: {result} - MAC: {mac}", end = "", flush = True)
 
-    
+    if resolve_names and host_info_tasks:
+        print(f"\n[+] Resolving hostnames and NetBIOS names for {len(host_info_tasks)} active hosts...")
+
+        completed_info = await asyncio.gather(*host_info_tasks, return_exceptions = True)
+
+        for info in completed_info:
+            if isinstance(info, dict):
+                active_hosts.add((info["ip"], info["mac"], info["dns_name"], info["netbios_name"]))
+                print(f"\r[+] Host: {info['ip']} - MAC: {info['mac']} - DNS: {info['dns_name']} - NetBIOS: {info['netbios_name']}", end="", flush=True)
+
     print(f"\n[+] Ping scan completed: {len(active_hosts)} hosts active")
     return active_hosts
 
@@ -1003,24 +1083,31 @@ async def _progress_updater(total: int, progress_q: asyncio.Queue,label: str = "
 
 # scan_hosts with workers and progress queue
 async def scan_hosts(cidr: str, ports: List[int], concurrency=200, timeout=2, show_progress=True, ping_first=True, ping_concurrency=100, ping_timeout=1.0, protocol="tcp",
-                     vuln_scanner: Optional[VulnerabilityScanner] = None):
+                     vuln_scanner: Optional[VulnerabilityScanner] = None, resolve_names: bool = False):
     
     net = ipaddress.ip_network(cidr, strict=False)
     all_hosts = [str(h) for h in net.hosts()]
 
     host_macs = {}
+    host_dns_names = {}
+    host_netbios_names = {}
 
     #--- Fase 1: Ping ---
     if ping_first:
-        active_hosts_set = await ping_hosts_parallel(all_hosts, concurrency=ping_concurrency, timeout=ping_timeout)
-        hosts = [host for host, mac in active_hosts_set]
-        host_macs = {host: mac for host, mac in active_hosts_set}
+        active_hosts_set = await ping_hosts_parallel(all_hosts, concurrency=ping_concurrency, timeout=ping_timeout, resolve_names= resolve_names)
+        hosts = [host for host, mac, dns_name, netbios_name in active_hosts_set]
+        host_macs = {host: mac for host, mac, dns_name, netbios_name in active_hosts_set}
+        host_dns_names = {host: dns_name for host, mac, dns_name, netbios_name in active_hosts_set}
+        host_netbios_names = {host: netbios_name for host, mac, dns_name, netbios_name in active_hosts_set}
+        
         if not hosts:
             print("[+] No active hosts found with ping.")
             return []
     else:
         hosts = all_hosts
         host_macs = {}
+        host_dns_names = {}
+        host_netbios_names = {}
     
     print(f"[+] Scanning {len(hosts)} active hosts on {len(ports)} ports...")
 
@@ -1029,8 +1116,10 @@ async def scan_hosts(cidr: str, ports: List[int], concurrency=200, timeout=2, sh
 
     for host in hosts:
         mac = host_macs.get(host, "unknown")
+        dns_name = host_dns_names.get(host, "unknown")
+        netbios_name = host_netbios_names.get(host, "unknown")
         for port in ports:
-            job_q.put_nowait((host, port, mac))
+            job_q.put_nowait((host, port, mac, dns_name, netbios_name))
 
     results: List[Dict] = []
     progress_q: asyncio.Queue = asyncio.Queue()
@@ -1038,10 +1127,12 @@ async def scan_hosts(cidr: str, ports: List[int], concurrency=200, timeout=2, sh
     async def worker():
         while True:
             try:
-                host, port, mac = job_q.get_nowait()
+                host, port, mac, dns_name, netbios_name = job_q.get_nowait()
             except asyncio.QueueEmpty:
                 break
             res = await scan_port(host, port, timeout, mac = mac, protocol=protocol, vuln_scanner = vuln_scanner)
+            res["dns_name"] = dns_name
+            res["netbios_name"] = netbios_name
             results.append(res)
             if show_progress:
                 await progress_q.put(1)
@@ -1070,7 +1161,7 @@ def save_json(results, filename="scan_results.json"):
         json.dump(results, f, indent=2, ensure_ascii=False)
 
 def save_csv(results, filename="scan_results.csv"):
-    keys = ["host", "mac", "port", "status", "severity", "banner", "timestamp", "vulnerabilities_count", "vulnerabilities_info",
+    keys = ["host", "dns_name", "netbios_name","mac", "port", "status", "severity", "banner", "timestamp", "vulnerabilities_count", "vulnerabilities_info",
             "ti_risk_score", "ti_categories", "ti_services"]
     
     with open(filename, "w", newline='', encoding="utf-8") as f:
@@ -1090,6 +1181,8 @@ def save_csv(results, filename="scan_results.csv"):
 
         row = {
             "host": r.get("host", ""),
+            "dns_name": r.get("dns_name", ""),
+            "netbios_name": r.get("netbios_name", ""),
             "mac": r.get("mac", ""),
             "port": r.get("port", ""),
             "status": r.get("status", ""),
@@ -1225,7 +1318,7 @@ def save_html(results, filename="scan_report.html"):
             <h2 style="margin-top:24px">Details by host</h2>
             <div class="card">
                 <table id="hostsTable">
-                    <thead><tr><th>Host</th><th>MAC Address</th><th>Open ports</th><th>Critical?</th><th>Details</th></tr></thead>
+                    <thead><tr><th>Host</th><th>DNS Name</th><th>NetBIOS Name</th><th>MAC Address</th><th>Open ports</th><th>Critical?</th><th>Details</th></tr></thead>
                     <tbody>
     """
     
@@ -1235,7 +1328,10 @@ def save_html(results, filename="scan_report.html"):
         critical = any(e.get("severity") == "critical" for e in open_entries)
         details = [f"{e.get('port')}({e.get('severity')})" for e in open_entries]
         mac = entries[0].get("mac", "unknown")
-        xhtml += f"<tr><td>{host}</td><td>{mac}</td><td>{open_count}</td><td>{'Yes' if critical else 'No'}</td><td>{', '.join(details)}</td></tr>"
+        dns_name = entries[0].get("dns_name", "unknown")
+        netbios_name = entries[0].get("netbios_name", "unknown")
+
+        xhtml += f"<tr><td>{host}</td><td>{dns_name}</td><td>{netbios_name}</td><td>{mac}</td><td>{open_count}</td><td>{'Yes' if critical else 'No'}</td><td>{', '.join(details)}</td></tr>"
     
     
     xhtml += f"""
@@ -1695,7 +1791,7 @@ def main():
     parser.add_argument("--include-all-for", default="", help="Comma-separated formats para los que aplicar include-all, ejemplo: txt,ecs")
     parser.add_argument("--min-severity", default=None, choices=["info","medium","high","critical"], help="Mínima severidad a exportar (incluye la indicada y superiores)")
     parser.add_argument("--txt-layout", default="detailed", choices=["detailed","compact"], help="Layout for the TXT file.")
-    parser.add_argument("--protocol", default = "both", choices=["tcp", "udp", "both"], help = "Scan type: TCP or UDP")
+    parser.add_argument("--protocol", default = "tcp", choices=["tcp", "udp", "both"], help = "Scan type: TCP or UDP")
     parser.add_argument("--tcp-ports", default=None, help="Lista de puertos TCP (ej: 22,80,8000-8010). If not specified, either --ports or DEFAULT_PORTS is used.")
     parser.add_argument("--udp-ports", default=None, help="Lista de puertos UDP (ej: 53,123). Si no se especifica, para --protocol both usarán los mismos que TCP.")
     parser.add_argument("--vuln-scan", action = "store_true", help = "Enable vulnerability scanning (increases scan time)")
@@ -1705,16 +1801,26 @@ def main():
     parser.add_argument("--ping-concurrency", type=int, default=100, help="Concurrency for ping scans (default: 100)")
     parser.add_argument("--ping-timeout", type=float, default=1.0, help="Timeout for ping in seconds (default: 1.0)")
 
-    # Nuevos argumentos para threat intelligence
+    # Argumentos para threat intelligence
     parser.add_argument("--threat-intel", action="store_true", help="Enable threat intelligence lookups")
     parser.add_argument("--abuseipdb-key", default=None, help="AbuseIPDB API key (or set ABUSEIPDB_KEY environment variable)")
     parser.add_argument("--virustotal-key", default=None, help="VirusTotal API key (or set VIRUSTOTAL_KEY environment variable)")
     parser.add_argument("--max-ti-concurrent", type=int, default=3, help="Maximum concurrent threat intelligence queries (default: 3)")
 
-    # Agregar argumento para forzar escaneo incluso con CIDR grande
+    # Argumento para forzar escaneo incluso con CIDR grande
     parser.add_argument("--force", action="store_true", help="Force scan even with large CIDR ranges")
 
+    # Argumento para carpeta de salida
+    parser.add_argument("--output-dir", default = "scan_reports", help = "Directory to save all report files (default: scan_reports)")
+
+    # Argumento para resolver nombres
+    parser.add_argument("--resolve-names", action = "store_true", help = "Resolve DNS and NetBIOS names for hosts (slower but more informative)")
+
     args = parser.parse_args()
+
+    # Crear carpeta de salida si no existe
+    os.makedirs(args.output_dir, exist_ok = True)
+    print(f"[+] Reports will be saved in: {os.path.abspath(args.output_dir)}")
 
     # Configurar API keys desde argumentos o variables de entorno
     api_keys = {}
@@ -1800,7 +1906,8 @@ def main():
                 ping_concurrency=args.ping_concurrency,
                 ping_timeout=args.ping_timeout,
                 protocol="tcp",
-                vuln_scanner = vuln_scanner
+                vuln_scanner = vuln_scanner,
+                resolve_names = args.resolve_names
             )))
         # UDP
         if args.protocol in ("udp", "both"):
@@ -1814,7 +1921,8 @@ def main():
                 ping_concurrency=args.ping_concurrency,
                 ping_timeout=args.ping_timeout,
                 protocol="udp",
-                vuln_scanner = vuln_scanner
+                vuln_scanner = vuln_scanner,
+                resolve_names = args.resolve_names
             )))
 
         if not tasks:
@@ -1876,27 +1984,27 @@ def main():
             use_results = [r for r in use_results if severity_rank(r.get('severity')) >= min_rank]
 
         if fmt == "json":
-            out = f"{prefix}scan_results.json" if prefix else "scan_results.json"
+            out = os.path.join(args.output_dir, f"{prefix}scan_results.json" if prefix else "scan_results.json")
             save_json(use_results, filename=out)
             print(f"[+] JSON exported: {out} (items: {len(use_results)})")
         elif fmt == "csv":
-            out = f"{prefix}scan_results.csv" if prefix else "scan_results.csv"
+            out = os.path.join(args.output_dir,f"{prefix}scan_results.csv" if prefix else "scan_results.csv")
             save_csv(use_results, filename=out)
             print(f"[+] CSV exported: {out} (items: {len(use_results)})")
         elif fmt == "html":
-            out = f"{prefix}scan_report.html" if prefix else "scan_report.html"
+            out = os.path.join(args.output_dir,f"{prefix}scan_report.html" if prefix else "scan_report.html")
             save_html(use_results, filename=out)
             print(f"[+] HTML exported: {out} (items: {len(use_results)})")
         elif fmt == "txt":
-            out = f"{prefix}scan_results.txt" if prefix else "scan_results.txt"
+            out = os.path.join(args.output_dir,f"{prefix}scan_results.txt" if prefix else "scan_results.txt")
             save_txt(use_results, filename=out, layout=args.txt_layout)
             print(f"[+] TXT exported: {out} (layout: {args.txt_layout}, items: {len(use_results)})")
         elif fmt == "ecs":
-            out = f"{prefix}ecs_events.ndjson" if prefix else "ecs_events.ndjson"
+            out = os.path.join(args.output_dir,f"{prefix}ecs_events.ndjson" if prefix else "ecs_events.ndjson")
             export_ecs_ndjson(use_results, out_path=out, scanner_ip=args.scanner_ip)
             print(f"[+] ECS NDJSON exported: {out} (items: {len(use_results)})")
         elif fmt == "cef":
-            out = f"{prefix}scan_results.cef" if prefix else "scan_results.cef"
+            out = os.path.join(args.output_dir,f"{prefix}scan_results.cef" if prefix else "scan_results.cef")
             export_cef_file(use_results, out_path=out, scanner_ip=args.scanner_ip)
             print(f"[+] CEF exported: {out} (items: {len(use_results)})")
         else:
